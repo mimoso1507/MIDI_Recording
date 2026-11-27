@@ -2,7 +2,7 @@
 
 Grabador MIDI multipista para Android con una interfaz al estilo de Audacity, pensada para la pantalla del móvil.
 
-## Qué hace (versión 0.2)
+## Qué hace (versión 0.3)
 
 - Se conecta a la vez a teclados y controladores MIDI por **USB (OTG)** y **Bluetooth LE MIDI**.
 - **Graba** lo que tocas (notas, pedal, pitch bend) con un solo botón. Cada toma crea una pista nueva.
@@ -12,6 +12,7 @@ Grabador MIDI multipista para Android con una interfaz al estilo de Audacity, pe
 - **Agrupar** dos o más pistas en una sola fila para ahorrar pantalla, y desagruparlas después sin perder nada. Mute y Solo del grupo actúan sobre todas sus pistas.
 - **Metrónomo** por el audio del teléfono, con el primer tiempo del compás más agudo.
 - **Deshacer** cualquier cambio.
+- **Modo aprender**: asigna botones, pads o teclas de tu controlador (USB o Bluetooth) a Grabar, Reproducir/Pausa, Detener, Ir al inicio, Metrónomo, Subir/Bajar BPM, Mute, Solo y Deshacer. Está en el icono de dispositivos → «Usar botones del controlador». Esos botones no se graban como notas.
 - El proyecto se guarda solo.
 
 ## Cómo se usa
@@ -27,9 +28,8 @@ Grabador MIDI multipista para Android con una interfaz al estilo de Audacity, pe
 
 ## Próximas versiones
 
-1. Modo "aprender" para usar botones del controlador como Rec, Play/Pausa, Stop, metrónomo, BPM +/−…
-2. Sintetizador interno con SoundFont (GeneralUser GS incluido y tus propios .sf2) por auriculares o altavoz.
-3. Importar/exportar .mid, importar WAV/MP3 para escuchar y exportar la mezcla a WAV/MP3.
+1. Sintetizador interno con SoundFont (GeneralUser GS incluido y tus propios .sf2) por auriculares o altavoz.
+2. Importar/exportar .mid, importar WAV/MP3 para escuchar y exportar la mezcla a WAV/MP3.
 
 ## Compilar
 

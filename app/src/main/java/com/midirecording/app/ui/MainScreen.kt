@@ -37,6 +37,7 @@ fun MainScreen(vm: MainViewModel) {
     val canUndo by vm.canUndo.collectAsStateWithLifecycle()
 
     var showDevices by remember { mutableStateOf(false) }
+    var showControls by remember { mutableStateOf(false) }
     var instrumentFor by remember { mutableStateOf<Track?>(null) }
     var renameFor by remember { mutableStateOf<Track?>(null) }
     var showBpmDialog by remember { mutableStateOf(false) }
@@ -130,10 +131,21 @@ fun MainScreen(vm: MainViewModel) {
     }
 
     if (showDevices) {
-        DevicesDialog(vm = vm, onDismiss = {
-            vm.stopBleScan()
-            showDevices = false
-        })
+        DevicesDialog(
+            vm = vm,
+            onOpenControls = {
+                vm.stopBleScan()
+                showDevices = false
+                showControls = true
+            },
+            onDismiss = {
+                vm.stopBleScan()
+                showDevices = false
+            },
+        )
+    }
+    if (showControls) {
+        ControlsDialog(vm = vm, onDismiss = { showControls = false })
     }
     instrumentFor?.let { track ->
         InstrumentDialog(

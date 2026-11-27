@@ -102,7 +102,7 @@ fun TransportBar(
         Spacer(Modifier.width(8.dp))
         TimeDisplay(position, project, recording)
         Spacer(Modifier.width(8.dp))
-        BpmControl(project.bpm, enabled = !playing, onBpmChange, onBpmClick)
+        BpmControl(project.bpm, enabled = !recording, onBpmChange, onBpmClick)
         TransportButton(
             Icons.Filled.AvTimer,
             if (metronomeOn) "Apagar metrónomo" else "Encender metrónomo",

@@ -12,6 +12,9 @@ import com.midirecording.app.engine.Player
 import com.midirecording.app.engine.Recorder
 import com.midirecording.app.midi.BleMidiCandidate
 import com.midirecording.app.midi.BleMidiScanner
+import com.midirecording.app.midi.ControlAction
+import com.midirecording.app.midi.ControlMapper
+import com.midirecording.app.midi.MidiTrigger
 import com.midirecording.app.midi.MidiDeviceEntry
 import com.midirecording.app.midi.MidiDeviceRepository
 import com.midirecording.app.midi.MidiEvent
@@ -54,6 +57,15 @@ data class InputActivity(val deviceName: String, val note: Int, val atMillis: Lo
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val store = ProjectStore(File(app.filesDir, "project.json"))
+    private val prefs = app.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+    private val mapper = ControlMapper(ControlMapper.decode(prefs.getString(PREF_CONTROLS, null)))
+
+    private val _controlBindings = MutableStateFlow(mapper.bindings())
+    val controlBindings: StateFlow<Map<ControlAction, MidiTrigger>> = _controlBindings.asStateFlow()
+
+    private val _learning = MutableStateFlow<ControlAction?>(null)
+    /** Acción que está esperando a que pulses un botón del controlador. */
+    val learning: StateFlow<ControlAction?> = _learning.asStateFlow()
     private val recorder = Recorder()
     private val devicesRepo = MidiDeviceRepository(app, ::onMidiEvent)
     private val bleScanner = BleMidiScanner(app)
@@ -125,6 +137,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ---------- Entrada MIDI ----------
 
     private fun onMidiEvent(deviceId: Int, event: MidiEvent, timestamp: Long) {
+        when (val result = mapper.process(event)) {
+            ControlMapper.Result.PassThrough -> Unit
+            ControlMapper.Result.Consumed -> return
+            is ControlMapper.Result.Triggered -> {
+                viewModelScope.launch(Dispatchers.Main) { perform(result.action) }
+                return
+            }
+            is ControlMapper.Result.Learned -> {
+                viewModelScope.launch(Dispatchers.Main) {
+                    _learning.value = null
+                    saveBindings()
+                    _messages.tryEmit("${result.action.label}: ${result.trigger.describe()}")
+                }
+                return
+            }
+        }
         recorder.onEvent(event, timestamp)
         if (event is MidiEvent.NoteOn) {
             lastInputDeviceId = deviceId
@@ -451,11 +479,60 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun changeBpm(delta: Double) = setBpm(_project.value.bpm + delta)
 
     fun setBpm(bpm: Double) {
-        if (_transport.value == TransportState.PLAYING || _transport.value == TransportState.RECORDING) {
-            _messages.tryEmit("Detén la reproducción para cambiar el BPM")
-            return
+        when (_transport.value) {
+            TransportState.RECORDING -> {
+                _messages.tryEmit("No se puede cambiar el BPM mientras se graba")
+            }
+            TransportState.PLAYING -> {
+                // Sigue sonando desde el mismo punto con el tempo nuevo.
+                val at = currentTick()
+                stopEngines()
+                updateProject { it.copy(bpm = bpm.coerceIn(20.0, 300.0)) }
+                beginTransport(at, TransportState.PLAYING)
+            }
+            else -> updateProject { it.copy(bpm = bpm.coerceIn(20.0, 300.0)) }
         }
-        updateProject { it.copy(bpm = bpm.coerceIn(20.0, 300.0)) }
+    }
+
+    // ---------- Botones del controlador (modo aprender) ----------
+
+    fun learn(action: ControlAction?) {
+        mapper.startLearning(action)
+        _learning.value = action
+    }
+
+    fun clearBinding(action: ControlAction) {
+        mapper.clear(action)
+        saveBindings()
+    }
+
+    private fun saveBindings() {
+        val b = mapper.bindings()
+        _controlBindings.value = b
+        prefs.edit().putString(PREF_CONTROLS, ControlMapper.encode(b)).apply()
+    }
+
+    private fun perform(action: ControlAction) {
+        when (action) {
+            ControlAction.RECORD -> record()
+            ControlAction.PLAY_PAUSE -> playPause()
+            ControlAction.STOP -> stop()
+            ControlAction.GO_TO_START -> goToStart()
+            ControlAction.METRONOME -> toggleMetronome()
+            ControlAction.BPM_UP -> changeBpm(1.0)
+            ControlAction.BPM_DOWN -> changeBpm(-1.0)
+            ControlAction.UNDO -> undo()
+            ControlAction.MUTE, ControlAction.SOLO -> {
+                val ids = _selection.value?.trackIds
+                if (ids.isNullOrEmpty()) {
+                    _messages.tryEmit("Selecciona una pista para usar Mute o Solo desde el controlador")
+                } else if (action == ControlAction.MUTE) {
+                    toggleMuteAll(ids)
+                } else {
+                    toggleSoloAll(ids)
+                }
+            }
+        }
     }
 
     private fun updateTrack(trackId: Long, change: (Track) -> Track) = updateProject { p ->
@@ -503,5 +580,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         const val TRACK_COLORS = 8
         const val MAX_UNDO = 50
+        const val PREF_CONTROLS = "controls"
     }
 }

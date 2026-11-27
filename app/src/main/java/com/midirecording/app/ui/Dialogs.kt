@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Cable
+import androidx.compose.material.icons.filled.Gamepad
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Usb
@@ -64,7 +65,7 @@ import com.midirecording.app.model.Track
 import com.midirecording.app.ui.theme.AppColors
 
 @Composable
-fun DevicesDialog(vm: MainViewModel, onDismiss: () -> Unit) {
+fun DevicesDialog(vm: MainViewModel, onOpenControls: () -> Unit, onDismiss: () -> Unit) {
     val devices by vm.devices.collectAsStateWithLifecycle()
     val output by vm.output.collectAsStateWithLifecycle()
     val bleResults by vm.bleResults.collectAsStateWithLifecycle()
@@ -105,6 +106,14 @@ fun DevicesDialog(vm: MainViewModel, onDismiss: () -> Unit) {
                     )
                 }
                 connected.forEach { DeviceRow(it) }
+
+                if (connected.isNotEmpty()) {
+                    OutlinedButton(onClick = onOpenControls) {
+                        Icon(Icons.Filled.Gamepad, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Usar botones del controlador (aprender)")
+                    }
+                }
 
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
                 SectionTitle("Salida de reproducción")
