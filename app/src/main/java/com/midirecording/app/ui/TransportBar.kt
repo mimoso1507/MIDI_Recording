@@ -73,6 +73,7 @@ fun TransportBar(
     canUndo: Boolean,
     onUndo: () -> Unit,
     onDevices: () -> Unit,
+    fileMenu: @Composable () -> Unit,
 ) {
     val recording = transport == TransportState.RECORDING
     val playing = transport == TransportState.PLAYING || recording
@@ -84,6 +85,7 @@ fun TransportBar(
             .padding(horizontal = 4.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        fileMenu()
         TransportButton(Icons.Filled.SkipPrevious, "Ir al inicio", onClick = onGoToStart)
         TransportButton(
             if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,

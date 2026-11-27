@@ -1,5 +1,6 @@
 package com.midirecording.app.data
 
+import com.midirecording.app.model.AudioClip
 import com.midirecording.app.model.ControlEvent
 import com.midirecording.app.model.Note
 import com.midirecording.app.model.Project
@@ -42,6 +43,9 @@ class ProjectStore(private val file: File) {
                 o.put("solo", t.solo)
                 o.put("color", t.colorIndex)
                 o.put("group", t.groupId ?: -1)
+                t.audio?.let { a ->
+                    o.put("audio", JSONObject().put("file", a.file).put("frames", a.frames).put("start", a.startTick))
+                }
                 val notes = JSONArray()
                 t.notes.forEach {
                     notes.put(it.pitch); notes.put(it.velocity); notes.put(it.startTick); notes.put(it.durationTicks)
@@ -86,6 +90,9 @@ class ProjectStore(private val file: File) {
                     solo = o.optBoolean("solo"),
                     colorIndex = o.optInt("color", 0),
                     groupId = o.optLong("group", -1).takeIf { it >= 0 },
+                    audio = o.optJSONObject("audio")?.let { a ->
+                        AudioClip(a.getString("file"), a.getLong("frames"), a.optLong("start", 0))
+                    },
                 )
             }
             val g = root.optJSONArray("groups") ?: JSONArray()

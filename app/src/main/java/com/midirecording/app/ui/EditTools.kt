@@ -15,6 +15,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material3.AlertDialog
@@ -108,4 +112,50 @@ fun QuantizeDialog(
             }
         },
     )
+}
+
+/** Menú «Archivo»: nuevo, importar/exportar MIDI, importar audio y exportar la mezcla. */
+@Composable
+fun FileMenu(
+    onNew: () -> Unit,
+    onImportMidi: () -> Unit,
+    onExportMidi: () -> Unit,
+    onImportAudio: () -> Unit,
+    onExportWav: () -> Unit,
+    onExportMp3: () -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    androidx.compose.foundation.layout.Box {
+        IconButton(onClick = { open = true }) {
+            Icon(Icons.Filled.FolderOpen, "Archivo", tint = Color.White)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(text = { Text("Nuevo proyecto") }, onClick = {
+                open = false
+                onNew()
+            })
+            HorizontalDivider()
+            DropdownMenuItem(text = { Text("Importar MIDI (.mid)…") }, onClick = {
+                open = false
+                onImportMidi()
+            })
+            DropdownMenuItem(text = { Text("Exportar MIDI (.mid)…") }, onClick = {
+                open = false
+                onExportMidi()
+            })
+            HorizontalDivider()
+            DropdownMenuItem(text = { Text("Importar audio para escuchar (WAV/MP3)…") }, onClick = {
+                open = false
+                onImportAudio()
+            })
+            DropdownMenuItem(text = { Text("Exportar mezcla a WAV…") }, onClick = {
+                open = false
+                onExportWav()
+            })
+            DropdownMenuItem(text = { Text("Exportar mezcla a MP3…") }, onClick = {
+                open = false
+                onExportMp3()
+            })
+        }
+    }
 }

@@ -40,6 +40,16 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import android.net.Uri
+import android.provider.OpenableColumns
+import com.midirecording.app.engine.AudioClipPlayer
+import com.midirecording.app.io.AudioDecoder
+import com.midirecording.app.io.MidiFile
+import com.midirecording.app.io.MixRenderer
+import com.midirecording.app.io.Mp3Writer
+import com.midirecording.app.io.PcmFile
+import com.midirecording.app.io.WavWriter
+import com.midirecording.app.model.AudioClip
 
 enum class TransportState { STOPPED, PLAYING, PAUSED, RECORDING }
 
@@ -76,6 +86,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val player = Player { resolveOutput() }
     private val metronome = Metronome()
     private val soundFontLibrary = SoundFontLibrary(app)
+    private val audioDir = File(app.filesDir, "audio").apply { mkdirs() }
+    private val audioPlayer = AudioClipPlayer(audioDir)
+
+    private val _peaks = MutableStateFlow<Map<String, FloatArray>>(emptyMap())
+    /** Forma de onda de cada audio importado, por nombre de archivo. */
+    val peaks: StateFlow<Map<String, FloatArray>> = _peaks.asStateFlow()
+
+    private val _busy = MutableStateFlow<String?>(null)
+    /** Mensaje mientras se importa o exporta algo largo. */
+    val busy: StateFlow<String?> = _busy.asStateFlow()
     private val synth = SynthOutput(null)
 
     private val _soundFonts = MutableStateFlow<List<String>>(emptyList())
@@ -147,6 +167,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val loaded = withContext(Dispatchers.IO) { store.load() }
             if (loaded != null && _project.value.tracks.isEmpty()) _project.value = loaded
+            loadPeaks()
         }
     }
 
@@ -212,6 +233,143 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return if (synth.soundFont != null) synth else null
     }
 
+    // ---------- Archivos: MIDI, audio y mezcla ----------
+
+    private fun displayName(uri: Uri): String =
+        getApplication<Application>().contentResolver
+            .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            ?: "archivo"
+
+    private suspend fun loadPeaks() = withContext(Dispatchers.IO) {
+        val map = HashMap(_peaks.value)
+        _project.value.tracks.mapNotNull { it.audio?.file }.forEach { name ->
+            if (name !in map) {
+                val f = File(audioDir, name)
+                if (f.exists()) map[name] = PcmFile.peaks(f)
+            }
+        }
+        _peaks.value = map
+    }
+
+    fun newProject() {
+        if (_transport.value == TransportState.RECORDING) return
+        stop()
+        updateProject { Project(bpm = it.bpm, beatsPerBar = it.beatsPerBar) }
+        _selection.value = null
+        _cursor.value = 0
+        _position.value = 0
+    }
+
+    fun importMidi(uri: Uri) {
+        stop()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val bytes = getApplication<Application>().contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+                val current = _project.value
+                val imported = MidiFile.read(bytes, current.nextTrackId)
+                if (imported.tracks.isEmpty()) {
+                    _messages.tryEmit("El archivo MIDI no tiene notas")
+                    return@launch
+                }
+                withContext(Dispatchers.Main) {
+                    updateProject { p ->
+                        if (p.tracks.isEmpty()) {
+                            imported
+                        } else {
+                            p.copy(tracks = p.tracks + imported.tracks, nextTrackId = imported.nextTrackId)
+                        }
+                    }
+                }
+                _messages.tryEmit("Importadas ${imported.tracks.size} pistas de ${displayName(uri)}")
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo importar el MIDI: ${e.message ?: "archivo no válido"}")
+            }
+        }
+    }
+
+    fun exportMidi(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val data = MidiFile.write(_project.value)
+                getApplication<Application>().contentResolver.openOutputStream(uri, "wt")!!.use { it.write(data) }
+                _messages.tryEmit("MIDI exportado")
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo exportar el MIDI")
+            }
+        }
+    }
+
+    fun importAudio(uri: Uri) {
+        val name = displayName(uri)
+        viewModelScope.launch(Dispatchers.IO) {
+            val file = "${java.util.UUID.randomUUID()}.pcm"
+            val target = File(audioDir, file)
+            try {
+                _busy.value = "Importando $name…"
+                val frames = AudioDecoder.decode(getApplication(), uri, target) { p ->
+                    _busy.value = "Importando $name… ${(p * 100).toInt()} %"
+                }
+                val wave = PcmFile.peaks(target)
+                _peaks.value = _peaks.value + (file to wave)
+                withContext(Dispatchers.Main) {
+                    updateProject { p ->
+                        val id = p.nextTrackId
+                        p.copy(
+                            tracks = p.tracks + Track(
+                                id = id,
+                                name = name.substringBeforeLast('.'),
+                                audio = AudioClip(file, frames, _cursor.value),
+                                colorIndex = ((id - 1) % TRACK_COLORS).toInt(),
+                            ),
+                            nextTrackId = id + 1,
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                target.delete()
+                _messages.tryEmit("No se pudo importar el audio: ${e.message ?: "formato no soportado"}")
+            } finally {
+                _busy.value = null
+            }
+        }
+    }
+
+    fun exportMix(uri: Uri, mp3: Boolean) {
+        val sf = synth.soundFont
+        if (sf == null) {
+            _messages.tryEmit("El sintetizador aún está cargando, inténtalo en unos segundos")
+            return
+        }
+        val project = _project.value
+        if (project.tracks.isEmpty()) {
+            _messages.tryEmit("No hay nada que exportar")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val resolver = getApplication<Application>().contentResolver
+            val label = if (mp3) "MP3" else "WAV"
+            try {
+                _busy.value = "Exportando $label…"
+                val progress: (Float) -> Unit = { _busy.value = "Exportando $label… ${(it * 100).toInt()} %" }
+                if (mp3) {
+                    val out = resolver.openOutputStream(uri, "wt")!!
+                    MixRenderer(project, sf, audioDir).render(Mp3Writer(out.buffered()), onProgress = progress)
+                } else {
+                    val tmp = File(getApplication<Application>().cacheDir, "mezcla.wav")
+                    MixRenderer(project, sf, audioDir).render(WavWriter(tmp), onProgress = progress)
+                    resolver.openOutputStream(uri, "wt")!!.use { out -> tmp.inputStream().use { it.copyTo(out) } }
+                    tmp.delete()
+                }
+                _messages.tryEmit("Mezcla exportada en $label")
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo exportar: ${e.message ?: label}")
+            } finally {
+                _busy.value = null
+            }
+        }
+    }
+
     // ---------- SoundFonts ----------
 
     private fun loadSoundFont(name: String) {
@@ -231,7 +389,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun importSoundFont(uri: android.net.Uri) {
+    fun importSoundFont(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             _messages.tryEmit("Cargando SoundFont…")
             try {
@@ -311,6 +469,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             recorder.start(fromTick, now, _project.value.bpm)
         }
         player.start(_project.value, fromTick, now)
+        audioPlayer.start(_project.value, fromTick)
         if (_metronomeOn.value) metronome.start(fromTick, _project.value.bpm, _project.value.beatsPerBar)
         _transport.value = state
         startTicker()
@@ -347,6 +506,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private fun stopEngines() {
         player.stop()
         metronome.stop()
+        audioPlayer.stop()
     }
 
     fun toggleMetronome() {
@@ -622,6 +782,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _canUndo.value = true
         _project.value = updated
         player.updateAudible(updated)
+        audioPlayer.updateAudible(updated)
         scheduleSave()
     }
 

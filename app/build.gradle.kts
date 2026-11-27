@@ -12,8 +12,8 @@ android {
         applicationId = "com.midirecording.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.5.0"
     }
 
     buildTypes {
@@ -50,6 +50,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    // Codificador MP3 (LAME portado a Java, LGPL 2.1+)
+    implementation("de.sciss:jump3r:1.0.5")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

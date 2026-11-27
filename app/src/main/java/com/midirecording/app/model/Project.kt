@@ -25,6 +25,14 @@ data class ControlEvent(
     val data2: Int,
 )
 
+/**
+ * Audio importado (WAV/MP3) que solo se escucha. Se guarda decodificado como
+ * PCM de 16 bits estéreo a [AUDIO_RATE] Hz en [file] (carpeta de audio de la app).
+ */
+data class AudioClip(val file: String, val frames: Long, val startTick: Long = 0)
+
+const val AUDIO_RATE = 44100
+
 data class Track(
     val id: Long,
     val name: String,
@@ -38,7 +46,11 @@ data class Track(
     val colorIndex: Int = 0,
     /** Grupo visual al que pertenece (varias pistas en una sola fila), o null. */
     val groupId: Long? = null,
+    /** Si no es null, es una pista de audio (sin notas). */
+    val audio: AudioClip? = null,
 ) {
+    val isAudio: Boolean get() = audio != null
+
     val endTick: Long
         get() = max(notes.maxOfOrNull { it.endTick } ?: 0L, controls.maxOfOrNull { it.tick } ?: 0L)
 }
@@ -77,7 +89,11 @@ data class Project(
         return rows
     }
 
-    val endTick: Long get() = tracks.maxOfOrNull { it.endTick } ?: 0L
+    val endTick: Long
+        get() = tracks.maxOfOrNull { t ->
+            val clip = t.audio
+            if (clip != null) clip.startTick + TimeMath.nanosToTicks(clip.frames * 1_000_000_000L / AUDIO_RATE, bpm) else t.endTick
+        } ?: 0L
     val ticksPerBar: Long get() = PPQ.toLong() * beatsPerBar
 
     /** Pistas que deben sonar teniendo en cuenta Solo y Mute. */

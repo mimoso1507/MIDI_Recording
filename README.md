@@ -2,7 +2,7 @@
 
 Grabador MIDI multipista para Android con una interfaz al estilo de Audacity, pensada para la pantalla del móvil.
 
-## Qué hace (versión 0.4)
+## Qué hace (versión 0.5)
 
 - Se conecta a la vez a teclados y controladores MIDI por **USB (OTG)** y **Bluetooth LE MIDI**.
 - **Graba** lo que tocas (notas, pedal, pitch bend) con un solo botón. Cada toma crea una pista nueva.
@@ -14,6 +14,7 @@ Grabador MIDI multipista para Android con una interfaz al estilo de Audacity, pe
 - **Metrónomo** por el audio del teléfono, con el primer tiempo del compás más agudo.
 - **Deshacer** cualquier cambio.
 - **Modo aprender**: asigna botones, pads o teclas de tu controlador (USB o Bluetooth) a Grabar, Reproducir/Pausa, Detener, Ir al inicio, Metrónomo, Subir/Bajar BPM, Mute, Solo y Deshacer. Está en el icono de dispositivos → «Usar botones del controlador». Esos botones no se graban como notas.
+- **Archivos** (icono de carpeta): importar y exportar **.mid**, importar **WAV/MP3** como pistas de audio solo para escuchar (con forma de onda, Mute/Solo) y exportar la mezcla completa a **WAV** o **MP3**.
 - El proyecto se guarda solo.
 
 ## Cómo se usa
@@ -26,10 +27,6 @@ Grabador MIDI multipista para Android con una interfaz al estilo de Audacity, pe
 | Pellizcar o botones +/− | Zoom |
 | Tocar el nombre de la pista | Seleccionar la pista entera |
 | Con algo seleccionado | Aparece la barra: Cuantizar, Agrupar, Borrar notas |
-
-## Próximas versiones
-
-1. Importar/exportar .mid, importar WAV/MP3 para escuchar y exportar la mezcla a WAV/MP3.
 
 ## Compilar
 
@@ -44,3 +41,4 @@ Cada push compila el APK en GitHub Actions; se descarga desde la pestaña **Acti
 ## Créditos
 
 - [GeneralUser GS](https://schristiancollins.com/generaluser.php) de S. Christian Collins, incluido según su licencia (`app/src/main/assets/soundfonts/GeneralUser-GS-LICENSE.txt`).
+- Exportación MP3 con [jump3r](https://github.com/Sciss/jump3r), LAME portado a Java (LGPL 2.1+).

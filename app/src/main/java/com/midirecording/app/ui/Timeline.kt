@@ -66,6 +66,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.midirecording.app.model.AUDIO_RATE
 import com.midirecording.app.model.GM_INSTRUMENTS
 import com.midirecording.app.model.Note
 import com.midirecording.app.model.PPQ
@@ -96,6 +97,7 @@ private const val MAX_PX_PER_TICK = 1.5f
 @Composable
 fun Timeline(
     project: Project,
+    peaks: Map<String, FloatArray>,
     recordingNotes: List<Note>,
     transport: TransportState,
     positionFlow: StateFlow<Long>,
@@ -213,6 +215,7 @@ fun Timeline(
                         } else {
                             val track = row.tracks.first()
                             TrackHeader(
+                                isAudio = track.isAudio,
                                 track = track,
                                 selected = selected,
                                 onSelect = { onSelectRow(ids) },
@@ -341,6 +344,23 @@ fun Timeline(
                         if (top > h || top + trackPx < rulerPx) return@forEachIndexed
                         val range = pitchRange(row.tracks.flatMap { it.notes })
                         row.tracks.forEach { track ->
+                            val clip = track.audio
+                            if (clip != null) {
+                                drawWaveform(
+                                    peaks = peaks[clip.file],
+                                    startTick = clip.startTick,
+                                    frames = clip.frames,
+                                    bpm = project.bpm,
+                                    top = top,
+                                    rowHeight = trackPx,
+                                    color = AppColors.Tracks[track.colorIndex % AppColors.Tracks.size],
+                                    faded = track.id !in audible,
+                                    pxPerTick = pxPerTick,
+                                    scrollX = scrollX,
+                                    width = w,
+                                )
+                                return@forEach
+                            }
                             drawNotes(
                                 notes = track.notes,
                                 range = range,
@@ -435,6 +455,45 @@ fun Timeline(
     }
 }
 
+/** Forma de onda de una pista de audio; cada pico cubre [PEAK_BLOCK] frames. */
+private fun DrawScope.drawWaveform(
+    peaks: FloatArray?,
+    startTick: Long,
+    frames: Long,
+    bpm: Double,
+    top: Float,
+    rowHeight: Float,
+    color: Color,
+    faded: Boolean,
+    pxPerTick: Float,
+    scrollX: Float,
+    width: Float,
+) {
+    val ticksPerFrame = bpm * PPQ / 60.0 / AUDIO_RATE
+    val x0 = startTick * pxPerTick - scrollX
+    val x1 = (startTick + frames * ticksPerFrame).toFloat() * pxPerTick - scrollX
+    val c = color.copy(alpha = if (faded) 0.25f else 0.85f)
+    drawRect(color.copy(alpha = 0.10f), Offset(x0, top + 2f), Size(x1 - x0, rowHeight - 4f))
+    if (peaks == null || peaks.isEmpty()) return
+    val mid = top + rowHeight / 2
+    val half = rowHeight / 2 - 6f
+    val pxPerPeak = (PEAK_BLOCK * ticksPerFrame * pxPerTick).toFloat()
+    val firstPx = max(0f, x0)
+    val lastPx = min(width, x1)
+    var px = firstPx
+    while (px < lastPx) {
+        val from = ((px - x0) / pxPerPeak).toInt().coerceIn(0, peaks.lastIndex)
+        val to = ((px + 1f - x0) / pxPerPeak).toInt().coerceIn(from, peaks.lastIndex)
+        var m = 0f
+        for (k in from..to) if (peaks[k] > m) m = peaks[k]
+        val hgt = max(1f, m * half)
+        drawLine(c, Offset(px, mid - hgt), Offset(px, mid + hgt))
+        px += 1f
+    }
+}
+
+private const val PEAK_BLOCK = 512
+
 private fun pitchRange(notes: List<Note>): IntRange {
     if (notes.isEmpty()) return 54..66
     var lo = notes.minOf { it.pitch }
@@ -477,6 +536,7 @@ private fun DrawScope.drawNotes(
 
 @Composable
 private fun TrackHeader(
+    isAudio: Boolean,
     track: Track,
     selected: Boolean,
     onSelect: () -> Unit,
@@ -527,14 +587,16 @@ private fun TrackHeader(
                             menu = false
                             onRename()
                         })
-                        DropdownMenuItem(text = { Text("Instrumento y canal") }, onClick = {
-                            menu = false
-                            onInstrument()
-                        })
-                        DropdownMenuItem(text = { Text("Cuantizar pista entera") }, onClick = {
-                            menu = false
-                            onQuantize()
-                        })
+                        if (!isAudio) {
+                            DropdownMenuItem(text = { Text("Instrumento y canal") }, onClick = {
+                                menu = false
+                                onInstrument()
+                            })
+                            DropdownMenuItem(text = { Text("Cuantizar pista entera") }, onClick = {
+                                menu = false
+                                onQuantize()
+                            })
+                        }
                         DropdownMenuItem(text = { Text("Eliminar pista") }, onClick = {
                             menu = false
                             onDelete()
@@ -543,7 +605,7 @@ private fun TrackHeader(
                 }
             }
             Text(
-                track.program?.let { GM_INSTRUMENTS[it] } ?: "Canal ${track.channel + 1}",
+                if (isAudio) "Audio (solo escuchar)" else track.program?.let { GM_INSTRUMENTS[it] } ?: "Canal ${track.channel + 1}",
                 color = AppColors.Muted,
                 fontSize = 10.sp,
                 maxLines = 1,
