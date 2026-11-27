@@ -27,7 +27,9 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Cable
 import androidx.compose.material.icons.filled.Gamepad
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material3.AlertDialog
@@ -65,11 +67,17 @@ import com.midirecording.app.model.Track
 import com.midirecording.app.ui.theme.AppColors
 
 @Composable
-fun DevicesDialog(vm: MainViewModel, onOpenControls: () -> Unit, onDismiss: () -> Unit) {
+fun DevicesDialog(
+    vm: MainViewModel,
+    onOpenControls: () -> Unit,
+    onOpenSoundFonts: () -> Unit,
+    onDismiss: () -> Unit,
+) {
     val devices by vm.devices.collectAsStateWithLifecycle()
     val output by vm.output.collectAsStateWithLifecycle()
     val bleResults by vm.bleResults.collectAsStateWithLifecycle()
     val scanning by vm.bleScanning.collectAsStateWithLifecycle()
+    val activeSoundFont by vm.activeSoundFont.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     val permissions = if (Build.VERSION.SDK_INT >= 31) {
@@ -118,7 +126,7 @@ fun DevicesDialog(vm: MainViewModel, onOpenControls: () -> Unit, onDismiss: () -
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
                 SectionTitle("Salida de reproducción")
                 OutputOption(
-                    label = "El mismo dispositivo con el que tocas (recomendado)",
+                    label = "El mismo dispositivo con el que tocas (recomendado). Si no tiene sonido propio, suena por el teléfono.",
                     selected = output == OutputTarget.SameAsInput,
                     onClick = { vm.setOutput(OutputTarget.SameAsInput) },
                 )
@@ -131,12 +139,17 @@ fun DevicesDialog(vm: MainViewModel, onOpenControls: () -> Unit, onDismiss: () -
                     )
                 }
                 OutputOption(
-                    label = "Auriculares o altavoz del teléfono (próximamente)",
+                    label = "Auriculares o altavoz del teléfono" +
+                        (activeSoundFont?.let { " · ${it.removeSuffix(".sf2")}" } ?: " (cargando…)"),
                     icon = Icons.Filled.Headphones,
                     selected = output == OutputTarget.InternalSynth,
-                    enabled = false,
-                    onClick = {},
+                    onClick = { vm.setOutput(OutputTarget.InternalSynth) },
                 )
+                TextButton(onClick = onOpenSoundFonts) {
+                    Icon(Icons.Filled.LibraryMusic, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Sonidos del teléfono (SoundFonts .sf2)")
+                }
 
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
                 SectionTitle("Bluetooth MIDI")
@@ -303,6 +316,49 @@ fun TextInputDialog(
                     keyboardType = if (numeric) KeyboardType.Decimal else KeyboardType.Text,
                 ),
             )
+        },
+    )
+}
+
+@Composable
+fun SoundFontDialog(vm: MainViewModel, onDismiss: () -> Unit) {
+    val soundFonts by vm.soundFonts.collectAsStateWithLifecycle()
+    val active by vm.activeSoundFont.collectAsStateWithLifecycle()
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importSoundFont(uri)
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Listo") } },
+        title = { Text("Sonidos del teléfono") },
+        text = {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    "Se usan al escuchar por auriculares o altavoz. GeneralUser GS viene incluido; " +
+                        "puedes añadir tantos .sf2 como quieras y elegir cuál suena.",
+                    color = AppColors.Muted,
+                    fontSize = 13.sp,
+                )
+                soundFonts.forEach { name ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(selected = active == name, onClick = { vm.selectSoundFont(name) })
+                        Text(name.removeSuffix(".sf2"), Modifier.weight(1f), fontSize = 14.sp)
+                        if (name != com.midirecording.app.synth.SoundFontLibrary.DEFAULT_FILE) {
+                            IconButton(onClick = { vm.deleteSoundFont(name) }) {
+                                Icon(Icons.Filled.Delete, "Quitar", tint = AppColors.Muted)
+                            }
+                        }
+                    }
+                }
+                OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }) {
+                    Icon(Icons.Filled.Add, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Añadir archivo .sf2")
+                }
+            }
         },
     )
 }

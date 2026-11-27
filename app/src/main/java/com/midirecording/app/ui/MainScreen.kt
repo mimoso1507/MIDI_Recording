@@ -38,6 +38,7 @@ fun MainScreen(vm: MainViewModel) {
 
     var showDevices by remember { mutableStateOf(false) }
     var showControls by remember { mutableStateOf(false) }
+    var showSoundFonts by remember { mutableStateOf(false) }
     var instrumentFor by remember { mutableStateOf<Track?>(null) }
     var renameFor by remember { mutableStateOf<Track?>(null) }
     var showBpmDialog by remember { mutableStateOf(false) }
@@ -115,7 +116,7 @@ fun MainScreen(vm: MainViewModel) {
                         text = if (devices.any { it.isOpen && it.canRecord }) {
                             "Pulsa ● para grabar desde tu dispositivo MIDI"
                         } else {
-                            "Conecta un teclado o controlador MIDI por USB (OTG) o Bluetooth.\nToca el icono de dispositivos para buscar uno Bluetooth."
+                            "Conecta un teclado o controlador MIDI por USB (OTG) o Bluetooth.\nToca el icono del piano para buscar uno Bluetooth."
                         },
                         color = AppColors.Muted,
                         textAlign = TextAlign.Center,
@@ -138,11 +139,19 @@ fun MainScreen(vm: MainViewModel) {
                 showDevices = false
                 showControls = true
             },
+            onOpenSoundFonts = {
+                vm.stopBleScan()
+                showDevices = false
+                showSoundFonts = true
+            },
             onDismiss = {
                 vm.stopBleScan()
                 showDevices = false
             },
         )
+    }
+    if (showSoundFonts) {
+        SoundFontDialog(vm = vm, onDismiss = { showSoundFonts = false })
     }
     if (showControls) {
         ControlsDialog(vm = vm, onDismiss = { showControls = false })

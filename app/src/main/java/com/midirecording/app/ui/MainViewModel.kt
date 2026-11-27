@@ -15,6 +15,10 @@ import com.midirecording.app.midi.BleMidiScanner
 import com.midirecording.app.midi.ControlAction
 import com.midirecording.app.midi.ControlMapper
 import com.midirecording.app.midi.MidiTrigger
+import com.midirecording.app.midi.toBytes
+import com.midirecording.app.synth.SoundFont
+import com.midirecording.app.synth.SoundFontLibrary
+import com.midirecording.app.synth.SynthOutput
 import com.midirecording.app.midi.MidiDeviceEntry
 import com.midirecording.app.midi.MidiDeviceRepository
 import com.midirecording.app.midi.MidiEvent
@@ -43,7 +47,7 @@ sealed interface OutputTarget {
     /** El mismo dispositivo desde el que se toca (por defecto). */
     data object SameAsInput : OutputTarget
     data class Device(val id: Int) : OutputTarget
-    /** Sintetizador interno con SoundFont: llegará en una próxima versión. */
+    /** Sintetizador interno con SoundFont, por auriculares o altavoz. */
     data object InternalSynth : OutputTarget
 }
 
@@ -71,6 +75,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val bleScanner = BleMidiScanner(app)
     private val player = Player { resolveOutput() }
     private val metronome = Metronome()
+    private val soundFontLibrary = SoundFontLibrary(app)
+    private val synth = SynthOutput(null)
+
+    private val _soundFonts = MutableStateFlow<List<String>>(emptyList())
+    val soundFonts: StateFlow<List<String>> = _soundFonts.asStateFlow()
+
+    private val _activeSoundFont = MutableStateFlow<String?>(null)
+    /** SoundFont que usa el sintetizador interno, o null mientras carga. */
+    val activeSoundFont: StateFlow<String?> = _activeSoundFont.asStateFlow()
 
     private val _project = MutableStateFlow(Project())
     val project: StateFlow<Project> = _project.asStateFlow()
@@ -121,6 +134,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _messages.tryEmit("Este teléfono no soporta MIDI")
         }
         devicesRepo.start()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                soundFontLibrary.ensureDefault()
+                _soundFonts.value = soundFontLibrary.list()
+                val wanted = prefs.getString(PREF_SOUNDFONT, null)?.takeIf { it in _soundFonts.value }
+                loadSoundFont(wanted ?: SoundFontLibrary.DEFAULT_FILE)
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo preparar el sintetizador interno")
+            }
+        }
         viewModelScope.launch {
             val loaded = withContext(Dispatchers.IO) { store.load() }
             if (loaded != null && _project.value.tracks.isEmpty()) _project.value = loaded
@@ -129,6 +152,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         stopEngines()
+        synth.release()
         bleScanner.stop()
         devicesRepo.release()
         store.save(_project.value)
@@ -154,6 +178,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         recorder.onEvent(event, timestamp)
+        // Si se escucha por el sintetizador, también suena lo que tocas en vivo.
+        if (outputIsSynth()) synth.send(event.toBytes())
         if (event is MidiEvent.NoteOn) {
             lastInputDeviceId = deviceId
             _inputActivity.value = InputActivity(
@@ -166,17 +192,65 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- Salida ----------
 
+    /** Dispositivo MIDI al que enviar, o null si toca usar el sintetizador interno. */
+    private fun resolveDeviceId(): Int? = when (val target = _output.value) {
+        is OutputTarget.Device -> target.id.takeIf { id -> devices.value.any { it.id == id && it.isOpen } }
+        OutputTarget.SameAsInput -> {
+            val playable = devices.value.filter { it.canPlay && it.isOpen }
+            lastInputDeviceId?.takeIf { last -> playable.any { it.id == last } }
+                ?: playable.firstOrNull()?.id
+        }
+        OutputTarget.InternalSynth -> null
+    }
+
+    private fun outputIsSynth(): Boolean = resolveDeviceId() == null && synth.soundFont != null
+
     private fun resolveOutput(): MidiOut? {
-        val id = when (val target = _output.value) {
-            is OutputTarget.Device -> target.id
-            OutputTarget.SameAsInput -> {
-                val playable = devices.value.filter { it.canPlay && it.isOpen }
-                lastInputDeviceId?.takeIf { last -> playable.any { it.id == last } }
-                    ?: playable.firstOrNull()?.id
+        val id = resolveDeviceId()
+        if (id != null) return MidiOut { data -> devicesRepo.send(id, data) }
+        // Sin dispositivo que pueda sonar: auriculares o altavoz del teléfono.
+        return if (synth.soundFont != null) synth else null
+    }
+
+    // ---------- SoundFonts ----------
+
+    private fun loadSoundFont(name: String) {
+        val sf = SoundFont.load(soundFontLibrary.file(name))
+        synth.soundFont = sf
+        _activeSoundFont.value = name
+        prefs.edit().putString(PREF_SOUNDFONT, name).apply()
+    }
+
+    fun selectSoundFont(name: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                loadSoundFont(name)
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo cargar $name")
             }
-            OutputTarget.InternalSynth -> null
-        } ?: return null
-        return MidiOut { data -> devicesRepo.send(id, data) }
+        }
+    }
+
+    fun importSoundFont(uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _messages.tryEmit("Cargando SoundFont…")
+            try {
+                val name = soundFontLibrary.import(uri)
+                _soundFonts.value = soundFontLibrary.list()
+                loadSoundFont(name)
+                _messages.tryEmit("$name listo")
+            } catch (e: Exception) {
+                _messages.tryEmit(e.message ?: "No se pudo añadir el SoundFont")
+            }
+        }
+    }
+
+    fun deleteSoundFont(name: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            if (_activeSoundFont.value == name) loadSoundFont(SoundFontLibrary.DEFAULT_FILE)
+            soundFontLibrary.delete(name)
+            _soundFonts.value = soundFontLibrary.list()
+        }
     }
 
     fun setOutput(target: OutputTarget) {
@@ -185,7 +259,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun warnIfNoOutput() {
         if (resolveOutput() == null) {
-            _messages.tryEmit("No hay ninguna salida MIDI conectada para reproducir")
+            _messages.tryEmit("El sintetizador interno aún está cargando")
         }
     }
 
@@ -581,5 +655,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val TRACK_COLORS = 8
         const val MAX_UNDO = 50
         const val PREF_CONTROLS = "controls"
+        const val PREF_SOUNDFONT = "soundfont"
     }
 }
