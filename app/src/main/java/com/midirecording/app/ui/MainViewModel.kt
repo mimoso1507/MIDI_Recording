@@ -4,7 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.midirecording.app.data.ProjectStore
+import com.midirecording.app.engine.Metronome
 import com.midirecording.app.engine.MidiOut
+import com.midirecording.app.engine.QuantizeGrid
+import com.midirecording.app.engine.Quantizer
 import com.midirecording.app.engine.Player
 import com.midirecording.app.engine.Recorder
 import com.midirecording.app.midi.BleMidiCandidate
@@ -17,6 +20,7 @@ import com.midirecording.app.model.PPQ
 import com.midirecording.app.model.Project
 import com.midirecording.app.model.TimeMath
 import com.midirecording.app.model.Track
+import com.midirecording.app.model.TrackGroup
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -54,6 +58,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val devicesRepo = MidiDeviceRepository(app, ::onMidiEvent)
     private val bleScanner = BleMidiScanner(app)
     private val player = Player { resolveOutput() }
+    private val metronome = Metronome()
 
     private val _project = MutableStateFlow(Project())
     val project: StateFlow<Project> = _project.asStateFlow()
@@ -81,6 +86,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages: SharedFlow<String> = _messages
 
+    private val _metronomeOn = MutableStateFlow(false)
+    val metronomeOn: StateFlow<Boolean> = _metronomeOn.asStateFlow()
+
+    private val undoStack = ArrayDeque<Project>()
+    private val _canUndo = MutableStateFlow(false)
+    val canUndo: StateFlow<Boolean> = _canUndo.asStateFlow()
+
     val devices: StateFlow<List<MidiDeviceEntry>> = devicesRepo.devices
     val bleResults: StateFlow<List<BleMidiCandidate>> = bleScanner.results
     val bleScanning: StateFlow<Boolean> = bleScanner.scanning
@@ -104,7 +116,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
-        player.stop()
+        stopEngines()
         bleScanner.stop()
         devicesRepo.release()
         store.save(_project.value)
@@ -174,7 +186,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 stop()
                 return
             }
-            TransportState.PLAYING -> player.stop()
+            TransportState.PLAYING -> stopEngines()
             else -> Unit
         }
         val from = if (_transport.value == TransportState.STOPPED) {
@@ -197,6 +209,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             recorder.start(fromTick, now, _project.value.bpm)
         }
         player.start(_project.value, fromTick, now)
+        if (_metronomeOn.value) metronome.start(fromTick, _project.value.bpm, _project.value.beatsPerBar)
         _transport.value = state
         startTicker()
     }
@@ -206,14 +219,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (state != TransportState.PLAYING && state != TransportState.RECORDING) return
         tickerJob?.cancel()
         _position.value = currentTick()
-        player.stop()
+        stopEngines()
         if (state == TransportState.RECORDING) finishRecording()
         _transport.value = TransportState.PAUSED
     }
 
     fun stop() {
         tickerJob?.cancel()
-        player.stop()
+        stopEngines()
         if (_transport.value == TransportState.RECORDING) finishRecording()
         _transport.value = TransportState.STOPPED
         _position.value = _cursor.value
@@ -222,11 +235,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun goToStart() {
         val wasPlaying = _transport.value == TransportState.PLAYING
         if (_transport.value == TransportState.RECORDING) return
-        if (wasPlaying) player.stop()
+        if (wasPlaying) stopEngines()
         _cursor.value = 0
         _position.value = 0
         _selection.value = null
         if (wasPlaying) beginTransport(0, TransportState.PLAYING) else _transport.value = TransportState.STOPPED
+    }
+
+    private fun stopEngines() {
+        player.stop()
+        metronome.stop()
+    }
+
+    fun toggleMetronome() {
+        val on = !_metronomeOn.value
+        _metronomeOn.value = on
+        val state = _transport.value
+        if (state == TransportState.PLAYING || state == TransportState.RECORDING) {
+            if (on) {
+                metronome.start(currentTick(), _project.value.bpm, _project.value.beatsPerBar)
+            } else {
+                metronome.stop()
+            }
+        }
     }
 
     private fun currentTick(): Long =
@@ -276,7 +307,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _transport.value = TransportState.STOPPED
             }
             TransportState.PLAYING -> {
-                player.stop()
+                stopEngines()
                 beginTransport(t, TransportState.PLAYING)
             }
             TransportState.RECORDING -> Unit
@@ -295,19 +326,108 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Selecciona la pista entera, como al pulsar su cabecera en Audacity. */
-    fun selectTrack(trackId: Long) {
-        val end = maxOf(_project.value.endTick, PPQ.toLong())
+    fun selectRow(trackIds: Set<Long>) {
+        val end = maxOf(_project.value.endTick + 1, PPQ.toLong())
         val current = _selection.value
-        _selection.value = if (current != null && current.trackIds == setOf(trackId) && current.startTick == 0L) {
+        _selection.value = if (current != null && current.trackIds == trackIds && current.startTick == 0L) {
             null
         } else {
-            Selection(0, end, setOf(trackId))
+            Selection(0, end, trackIds)
         }
     }
 
-    fun toggleMute(trackId: Long) = updateTrack(trackId) { it.copy(muted = !it.muted) }
+    // ---------- Cuantizar, borrar, agrupar ----------
 
-    fun toggleSolo(trackId: Long) = updateTrack(trackId) { it.copy(solo = !it.solo) }
+    fun quantizeSelection(grid: QuantizeGrid, quantizeEnds: Boolean) {
+        val sel = _selection.value ?: return
+        quantize(sel.trackIds, sel.startTick, sel.endTick, grid, quantizeEnds)
+    }
+
+    fun quantizeTrack(trackId: Long, grid: QuantizeGrid, quantizeEnds: Boolean) =
+        quantize(setOf(trackId), 0, Long.MAX_VALUE, grid, quantizeEnds)
+
+    private fun quantize(ids: Set<Long>, start: Long, end: Long, grid: QuantizeGrid, ends: Boolean) {
+        updateProject { p ->
+            p.copy(tracks = p.tracks.map { t ->
+                if (t.id in ids) t.copy(notes = Quantizer.quantize(t.notes, grid.ticks, start, end, 1f, ends)) else t
+            })
+        }
+        _messages.tryEmit("Cuantizado a ${grid.label}")
+    }
+
+    fun deleteSelectedNotes() {
+        val sel = _selection.value ?: return
+        updateProject { p ->
+            p.copy(tracks = p.tracks.map { t ->
+                if (t.id in sel.trackIds) {
+                    t.copy(
+                        notes = t.notes.filterNot { it.startTick >= sel.startTick && it.startTick < sel.endTick },
+                        controls = t.controls.filterNot { it.tick >= sel.startTick && it.tick < sel.endTick },
+                    )
+                } else {
+                    t
+                }
+            })
+        }
+    }
+
+    fun groupSelected() {
+        val sel = _selection.value ?: return
+        if (sel.trackIds.size < 2) {
+            _messages.tryEmit("Selecciona dos o más pistas para agruparlas")
+            return
+        }
+        updateProject { p ->
+            val id = p.nextGroupId
+            val names = p.tracks.filter { it.id in sel.trackIds }.joinToString(" + ") { it.name }
+            cleanGroups(
+                p.copy(
+                    tracks = p.tracks.map { if (it.id in sel.trackIds) it.copy(groupId = id) else it },
+                    groups = p.groups + TrackGroup(id, names),
+                    nextGroupId = id + 1,
+                ),
+            )
+        }
+        _selection.value = null
+    }
+
+    fun ungroup(groupId: Long) {
+        updateProject { p ->
+            cleanGroups(p.copy(tracks = p.tracks.map { if (it.groupId == groupId) it.copy(groupId = null) else it }))
+        }
+    }
+
+    /** Quita grupos vacíos o de una sola pista. */
+    private fun cleanGroups(p: Project): Project {
+        val counts = p.tracks.mapNotNull { it.groupId }.groupingBy { it }.eachCount()
+        val alive = counts.filterValues { it >= 2 }.keys
+        return p.copy(
+            groups = p.groups.filter { it.id in alive },
+            tracks = p.tracks.map { if (it.groupId != null && it.groupId !in alive) it.copy(groupId = null) else it },
+        )
+    }
+
+    /** Mute o Solo de un grupo entero: si todas lo tienen, se quita; si no, se pone. */
+    fun toggleMuteAll(ids: Set<Long>) = updateProject { p ->
+        val allOn = p.tracks.filter { it.id in ids }.all { it.muted }
+        p.copy(tracks = p.tracks.map { if (it.id in ids) it.copy(muted = !allOn) else it })
+    }
+
+    fun toggleSoloAll(ids: Set<Long>) = updateProject { p ->
+        val allOn = p.tracks.filter { it.id in ids }.all { it.solo }
+        p.copy(tracks = p.tracks.map { if (it.id in ids) it.copy(solo = !allOn) else it })
+    }
+
+    fun undo() {
+        if (_transport.value == TransportState.RECORDING) return
+        val previous = undoStack.removeLastOrNull() ?: return
+        _canUndo.value = undoStack.isNotEmpty()
+        _project.value = previous
+        player.updateAudible(previous)
+        _selection.value = null
+        scheduleSave()
+    }
+
 
     fun renameTrack(trackId: Long, name: String) = updateTrack(trackId) { it.copy(name = name.ifBlank { it.name }) }
 
@@ -322,7 +442,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun setChannel(trackId: Long, channel: Int) = updateTrack(trackId) { it.copy(channel = channel.coerceIn(0, 15)) }
 
     fun deleteTrack(trackId: Long) {
-        updateProject { p -> p.copy(tracks = p.tracks.filterNot { it.id == trackId }) }
+        updateProject { p -> cleanGroups(p.copy(tracks = p.tracks.filterNot { it.id == trackId })) }
         _selection.value = _selection.value?.let { s ->
             s.copy(trackIds = s.trackIds - trackId).takeIf { it.trackIds.isNotEmpty() }
         }
@@ -343,7 +463,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun updateProject(change: (Project) -> Project) {
-        val updated = change(_project.value)
+        val before = _project.value
+        val updated = change(before)
+        if (updated == before) return
+        undoStack.addLast(before)
+        while (undoStack.size > MAX_UNDO) undoStack.removeFirst()
+        _canUndo.value = true
         _project.value = updated
         player.updateAudible(updated)
         scheduleSave()
@@ -377,5 +502,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         const val TRACK_COLORS = 8
+        const val MAX_UNDO = 50
     }
 }

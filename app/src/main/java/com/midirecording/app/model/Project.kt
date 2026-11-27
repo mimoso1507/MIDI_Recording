@@ -36,9 +36,18 @@ data class Track(
     val muted: Boolean = false,
     val solo: Boolean = false,
     val colorIndex: Int = 0,
+    /** Grupo visual al que pertenece (varias pistas en una sola fila), o null. */
+    val groupId: Long? = null,
 ) {
     val endTick: Long
         get() = max(notes.maxOfOrNull { it.endTick } ?: 0L, controls.maxOfOrNull { it.tick } ?: 0L)
+}
+
+data class TrackGroup(val id: Long, val name: String)
+
+/** Una fila de la línea de tiempo: una pista sola o un grupo de pistas. */
+data class TimelineRow(val tracks: List<Track>, val group: TrackGroup?) {
+    val trackIds: Set<Long> get() = tracks.map { it.id }.toSet()
 }
 
 data class Project(
@@ -46,7 +55,28 @@ data class Project(
     val beatsPerBar: Int = 4,
     val tracks: List<Track> = emptyList(),
     val nextTrackId: Long = 1,
+    val groups: List<TrackGroup> = emptyList(),
+    val nextGroupId: Long = 1,
 ) {
+    /**
+     * Filas a mostrar. Un grupo ocupa el lugar de su primera pista y
+     * contiene todas las demás, aunque no estuvieran juntas.
+     */
+    fun rows(): List<TimelineRow> {
+        val groupsById = groups.associateBy { it.id }
+        val emitted = HashSet<Long>()
+        val rows = ArrayList<TimelineRow>()
+        for (t in tracks) {
+            val group = t.groupId?.let { groupsById[it] }
+            if (group == null) {
+                rows += TimelineRow(listOf(t), null)
+            } else if (emitted.add(group.id)) {
+                rows += TimelineRow(tracks.filter { it.groupId == group.id }, group)
+            }
+        }
+        return rows
+    }
+
     val endTick: Long get() = tracks.maxOfOrNull { it.endTick } ?: 0L
     val ticksPerBar: Long get() = PPQ.toLong() * beatsPerBar
 

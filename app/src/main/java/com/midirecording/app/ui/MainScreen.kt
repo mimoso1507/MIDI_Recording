@@ -33,11 +33,15 @@ fun MainScreen(vm: MainViewModel) {
     val recordingNotes by vm.recordingNotes.collectAsStateWithLifecycle()
     val devices by vm.devices.collectAsStateWithLifecycle()
     val inputActivity by vm.inputActivity.collectAsStateWithLifecycle()
+    val metronomeOn by vm.metronomeOn.collectAsStateWithLifecycle()
+    val canUndo by vm.canUndo.collectAsStateWithLifecycle()
 
     var showDevices by remember { mutableStateOf(false) }
     var instrumentFor by remember { mutableStateOf<Track?>(null) }
     var renameFor by remember { mutableStateOf<Track?>(null) }
     var showBpmDialog by remember { mutableStateOf(false) }
+    /** null = cerrado; trackId = cuantizar esa pista entera; -1 = cuantizar la selección. */
+    var quantizeTarget by remember { mutableStateOf<Long?>(null) }
 
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(Unit) {
@@ -65,6 +69,10 @@ fun MainScreen(vm: MainViewModel) {
                 onGoToStart = vm::goToStart,
                 onBpmChange = vm::changeBpm,
                 onBpmClick = { showBpmDialog = true },
+                metronomeOn = metronomeOn,
+                onMetronome = vm::toggleMetronome,
+                canUndo = canUndo,
+                onUndo = vm::undo,
                 onDevices = {
                     vm.refreshDevices()
                     showDevices = true
@@ -80,14 +88,27 @@ fun MainScreen(vm: MainViewModel) {
                     selection = selection,
                     onSetCursor = vm::setCursor,
                     onSelect = vm::setSelection,
-                    onSelectTrack = vm::selectTrack,
-                    onToggleMute = vm::toggleMute,
-                    onToggleSolo = vm::toggleSolo,
+                    onSelectRow = vm::selectRow,
+                    onToggleMute = vm::toggleMuteAll,
+                    onToggleSolo = vm::toggleSoloAll,
                     onInstrument = { instrumentFor = it },
                     onRename = { renameFor = it },
+                    onQuantize = { quantizeTarget = it.id },
                     onDelete = { vm.deleteTrack(it.id) },
+                    onUngroup = vm::ungroup,
                     modifier = Modifier.fillMaxSize(),
                 )
+                val sel = selection
+                if (sel != null && transport != TransportState.RECORDING) {
+                    SelectionBar(
+                        selection = sel,
+                        onQuantize = { quantizeTarget = -1L },
+                        onGroup = vm::groupSelected,
+                        onDeleteNotes = vm::deleteSelectedNotes,
+                        onClear = { vm.setSelection(null) },
+                        modifier = Modifier.align(Alignment.BottomStart),
+                    )
+                }
                 if (project.tracks.isEmpty() && transport != TransportState.RECORDING) {
                     Text(
                         text = if (devices.any { it.isOpen && it.canRecord }) {
@@ -134,6 +155,16 @@ fun MainScreen(vm: MainViewModel) {
                 renameFor = null
             },
             onDismiss = { renameFor = null },
+        )
+    }
+    quantizeTarget?.let { target ->
+        QuantizeDialog(
+            title = if (target == -1L) "Cuantizar selección" else "Cuantizar pista entera",
+            onConfirm = { grid, ends ->
+                if (target == -1L) vm.quantizeSelection(grid, ends) else vm.quantizeTrack(target, grid, ends)
+                quantizeTarget = null
+            },
+            onDismiss = { quantizeTarget = null },
         )
     }
     if (showBpmDialog) {
