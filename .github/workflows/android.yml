@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,7 +19,21 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Tests y APK de depuración
         run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+      - name: Preparar APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk MIDI-Recording.apk
       - uses: actions/upload-artifact@v4
         with:
           name: midi-recording-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: MIDI-Recording.apk
+      # Enlace fijo a la última versión:
+      # https://github.com/<repo>/releases/latest/download/MIDI-Recording.apk
+      - name: Publicar versión
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: MIDI Recording (compilación ${{ github.run_number }}, ${{ github.ref_name }})
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: MIDI-Recording.apk
+          body: |
+            Instala `MIDI-Recording.apk` en tu teléfono Android. Si Android lo pide, permite instalar apps de origen desconocido.

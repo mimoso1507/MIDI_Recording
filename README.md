@@ -36,7 +36,11 @@ Requiere JDK 17 y el SDK de Android (API 35).
 ./gradlew assembleDebug
 ```
 
-Cada push compila el APK en GitHub Actions; se descarga desde la pestaña **Actions**, en los artefactos del run (`midi-recording-debug-apk`).
+Cada push compila el APK en GitHub Actions y lo publica como versión. La última siempre está en:
+
+**https://github.com/mimoso1507/MIDI_Recording/releases/latest/download/MIDI-Recording.apk**
+
+Todas las versiones se firman con la misma clave (`app/debug.keystore`), así que se pueden instalar encima de la anterior sin perder los proyectos.
 
 ## Créditos
 
