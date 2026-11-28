@@ -16,6 +16,17 @@ android {
         versionName = "0.5.0"
     }
 
+    signingConfigs {
+        // Clave de depuración fija (no es secreta) para que cada APK nuevo
+        // se pueda instalar encima del anterior sin perder los proyectos.
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
