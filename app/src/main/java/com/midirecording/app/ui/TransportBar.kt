@@ -17,7 +17,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AvTimer
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Piano
@@ -66,7 +68,12 @@ fun TransportBar(
     onGoToStart: () -> Unit,
     onBpmChange: (Double) -> Unit,
     onBpmClick: () -> Unit,
+    metronomeOn: Boolean,
+    onMetronome: () -> Unit,
+    canUndo: Boolean,
+    onUndo: () -> Unit,
     onDevices: () -> Unit,
+    fileMenu: @Composable () -> Unit,
 ) {
     val recording = transport == TransportState.RECORDING
     val playing = transport == TransportState.PLAYING || recording
@@ -78,6 +85,7 @@ fun TransportBar(
             .padding(horizontal = 4.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        fileMenu()
         TransportButton(Icons.Filled.SkipPrevious, "Ir al inicio", onClick = onGoToStart)
         TransportButton(
             if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
@@ -96,7 +104,20 @@ fun TransportBar(
         Spacer(Modifier.width(8.dp))
         TimeDisplay(position, project, recording)
         Spacer(Modifier.width(8.dp))
-        BpmControl(project.bpm, enabled = !playing, onBpmChange, onBpmClick)
+        BpmControl(project.bpm, enabled = !recording, onBpmChange, onBpmClick)
+        TransportButton(
+            Icons.Filled.AvTimer,
+            if (metronomeOn) "Apagar metrónomo" else "Encender metrónomo",
+            tint = if (metronomeOn) Color(0xFFF59E0B) else AppColors.Muted,
+            highlighted = metronomeOn,
+            onClick = onMetronome,
+        )
+        TransportButton(
+            Icons.AutoMirrored.Filled.Undo,
+            "Deshacer",
+            tint = if (canUndo && !recording) Color.White else AppColors.Muted,
+            onClick = onUndo,
+        )
         Spacer(Modifier.width(8.dp))
         InputIndicator(inputActivity)
         BadgedBox(badge = {

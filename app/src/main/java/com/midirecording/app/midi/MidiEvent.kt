@@ -14,6 +14,17 @@ sealed interface MidiEvent {
     data class PolyPressure(override val channel: Int, val note: Int, val pressure: Int) : MidiEvent
 }
 
+/** Vuelve a convertir el evento en bytes MIDI (para reenviarlo al sintetizador). */
+fun MidiEvent.toBytes(): ByteArray = when (this) {
+    is MidiEvent.NoteOn -> MidiBytes.noteOn(channel, note, velocity)
+    is MidiEvent.NoteOff -> MidiBytes.noteOff(channel, note)
+    is MidiEvent.ControlChange -> MidiBytes.controlChange(channel, controller, value)
+    is MidiEvent.ProgramChange -> MidiBytes.programChange(channel, program)
+    is MidiEvent.PitchBend -> MidiBytes.channelMessage(0xE0, channel, value and 0x7F, (value shr 7) and 0x7F)
+    is MidiEvent.ChannelPressure -> MidiBytes.channelMessage(0xD0, channel, pressure, 0)
+    is MidiEvent.PolyPressure -> MidiBytes.channelMessage(0xA0, channel, note, pressure)
+}
+
 object MidiBytes {
     fun noteOn(channel: Int, note: Int, velocity: Int) =
         byteArrayOf((0x90 or channel).toByte(), note.toByte(), velocity.toByte())

@@ -4,11 +4,21 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.midirecording.app.data.ProjectStore
+import com.midirecording.app.engine.Metronome
 import com.midirecording.app.engine.MidiOut
+import com.midirecording.app.engine.QuantizeGrid
+import com.midirecording.app.engine.Quantizer
 import com.midirecording.app.engine.Player
 import com.midirecording.app.engine.Recorder
 import com.midirecording.app.midi.BleMidiCandidate
 import com.midirecording.app.midi.BleMidiScanner
+import com.midirecording.app.midi.ControlAction
+import com.midirecording.app.midi.ControlMapper
+import com.midirecording.app.midi.MidiTrigger
+import com.midirecording.app.midi.toBytes
+import com.midirecording.app.synth.SoundFont
+import com.midirecording.app.synth.SoundFontLibrary
+import com.midirecording.app.synth.SynthOutput
 import com.midirecording.app.midi.MidiDeviceEntry
 import com.midirecording.app.midi.MidiDeviceRepository
 import com.midirecording.app.midi.MidiEvent
@@ -17,6 +27,7 @@ import com.midirecording.app.model.PPQ
 import com.midirecording.app.model.Project
 import com.midirecording.app.model.TimeMath
 import com.midirecording.app.model.Track
+import com.midirecording.app.model.TrackGroup
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -29,6 +40,16 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import android.net.Uri
+import android.provider.OpenableColumns
+import com.midirecording.app.engine.AudioClipPlayer
+import com.midirecording.app.io.AudioDecoder
+import com.midirecording.app.io.MidiFile
+import com.midirecording.app.io.MixRenderer
+import com.midirecording.app.io.Mp3Writer
+import com.midirecording.app.io.PcmFile
+import com.midirecording.app.io.WavWriter
+import com.midirecording.app.model.AudioClip
 
 enum class TransportState { STOPPED, PLAYING, PAUSED, RECORDING }
 
@@ -36,7 +57,7 @@ sealed interface OutputTarget {
     /** El mismo dispositivo desde el que se toca (por defecto). */
     data object SameAsInput : OutputTarget
     data class Device(val id: Int) : OutputTarget
-    /** Sintetizador interno con SoundFont: llegará en una próxima versión. */
+    /** Sintetizador interno con SoundFont, por auriculares o altavoz. */
     data object InternalSynth : OutputTarget
 }
 
@@ -50,10 +71,39 @@ data class InputActivity(val deviceName: String, val note: Int, val atMillis: Lo
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val store = ProjectStore(File(app.filesDir, "project.json"))
+    private val prefs = app.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+    private val mapper = ControlMapper(ControlMapper.decode(prefs.getString(PREF_CONTROLS, null)))
+
+    private val _controlBindings = MutableStateFlow(mapper.bindings())
+    val controlBindings: StateFlow<Map<ControlAction, MidiTrigger>> = _controlBindings.asStateFlow()
+
+    private val _learning = MutableStateFlow<ControlAction?>(null)
+    /** Acción que está esperando a que pulses un botón del controlador. */
+    val learning: StateFlow<ControlAction?> = _learning.asStateFlow()
     private val recorder = Recorder()
     private val devicesRepo = MidiDeviceRepository(app, ::onMidiEvent)
     private val bleScanner = BleMidiScanner(app)
     private val player = Player { resolveOutput() }
+    private val metronome = Metronome()
+    private val soundFontLibrary = SoundFontLibrary(app)
+    private val audioDir = File(app.filesDir, "audio").apply { mkdirs() }
+    private val audioPlayer = AudioClipPlayer(audioDir)
+
+    private val _peaks = MutableStateFlow<Map<String, FloatArray>>(emptyMap())
+    /** Forma de onda de cada audio importado, por nombre de archivo. */
+    val peaks: StateFlow<Map<String, FloatArray>> = _peaks.asStateFlow()
+
+    private val _busy = MutableStateFlow<String?>(null)
+    /** Mensaje mientras se importa o exporta algo largo. */
+    val busy: StateFlow<String?> = _busy.asStateFlow()
+    private val synth = SynthOutput(null)
+
+    private val _soundFonts = MutableStateFlow<List<String>>(emptyList())
+    val soundFonts: StateFlow<List<String>> = _soundFonts.asStateFlow()
+
+    private val _activeSoundFont = MutableStateFlow<String?>(null)
+    /** SoundFont que usa el sintetizador interno, o null mientras carga. */
+    val activeSoundFont: StateFlow<String?> = _activeSoundFont.asStateFlow()
 
     private val _project = MutableStateFlow(Project())
     val project: StateFlow<Project> = _project.asStateFlow()
@@ -81,6 +131,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages: SharedFlow<String> = _messages
 
+    private val _metronomeOn = MutableStateFlow(false)
+    val metronomeOn: StateFlow<Boolean> = _metronomeOn.asStateFlow()
+
+    private val undoStack = ArrayDeque<Project>()
+    private val _canUndo = MutableStateFlow(false)
+    val canUndo: StateFlow<Boolean> = _canUndo.asStateFlow()
+
     val devices: StateFlow<List<MidiDeviceEntry>> = devicesRepo.devices
     val bleResults: StateFlow<List<BleMidiCandidate>> = bleScanner.results
     val bleScanning: StateFlow<Boolean> = bleScanner.scanning
@@ -97,14 +154,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _messages.tryEmit("Este teléfono no soporta MIDI")
         }
         devicesRepo.start()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                soundFontLibrary.ensureDefault()
+                _soundFonts.value = soundFontLibrary.list()
+                val wanted = prefs.getString(PREF_SOUNDFONT, null)?.takeIf { it in _soundFonts.value }
+                loadSoundFont(wanted ?: SoundFontLibrary.DEFAULT_FILE)
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo preparar el sintetizador interno")
+            }
+        }
         viewModelScope.launch {
             val loaded = withContext(Dispatchers.IO) { store.load() }
             if (loaded != null && _project.value.tracks.isEmpty()) _project.value = loaded
+            loadPeaks()
         }
     }
 
     override fun onCleared() {
-        player.stop()
+        stopEngines()
+        synth.release()
         bleScanner.stop()
         devicesRepo.release()
         store.save(_project.value)
@@ -113,7 +182,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ---------- Entrada MIDI ----------
 
     private fun onMidiEvent(deviceId: Int, event: MidiEvent, timestamp: Long) {
+        when (val result = mapper.process(event)) {
+            ControlMapper.Result.PassThrough -> Unit
+            ControlMapper.Result.Consumed -> return
+            is ControlMapper.Result.Triggered -> {
+                viewModelScope.launch(Dispatchers.Main) { perform(result.action) }
+                return
+            }
+            is ControlMapper.Result.Learned -> {
+                viewModelScope.launch(Dispatchers.Main) {
+                    _learning.value = null
+                    saveBindings()
+                    _messages.tryEmit("${result.action.label}: ${result.trigger.describe()}")
+                }
+                return
+            }
+        }
         recorder.onEvent(event, timestamp)
+        // Si se escucha por el sintetizador, también suena lo que tocas en vivo.
+        if (outputIsSynth()) synth.send(event.toBytes())
         if (event is MidiEvent.NoteOn) {
             lastInputDeviceId = deviceId
             _inputActivity.value = InputActivity(
@@ -126,17 +213,202 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- Salida ----------
 
+    /** Dispositivo MIDI al que enviar, o null si toca usar el sintetizador interno. */
+    private fun resolveDeviceId(): Int? = when (val target = _output.value) {
+        is OutputTarget.Device -> target.id.takeIf { id -> devices.value.any { it.id == id && it.isOpen } }
+        OutputTarget.SameAsInput -> {
+            val playable = devices.value.filter { it.canPlay && it.isOpen }
+            lastInputDeviceId?.takeIf { last -> playable.any { it.id == last } }
+                ?: playable.firstOrNull()?.id
+        }
+        OutputTarget.InternalSynth -> null
+    }
+
+    private fun outputIsSynth(): Boolean = resolveDeviceId() == null && synth.soundFont != null
+
     private fun resolveOutput(): MidiOut? {
-        val id = when (val target = _output.value) {
-            is OutputTarget.Device -> target.id
-            OutputTarget.SameAsInput -> {
-                val playable = devices.value.filter { it.canPlay && it.isOpen }
-                lastInputDeviceId?.takeIf { last -> playable.any { it.id == last } }
-                    ?: playable.firstOrNull()?.id
+        val id = resolveDeviceId()
+        if (id != null) return MidiOut { data -> devicesRepo.send(id, data) }
+        // Sin dispositivo que pueda sonar: auriculares o altavoz del teléfono.
+        return if (synth.soundFont != null) synth else null
+    }
+
+    // ---------- Archivos: MIDI, audio y mezcla ----------
+
+    private fun displayName(uri: Uri): String =
+        getApplication<Application>().contentResolver
+            .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            ?: "archivo"
+
+    private suspend fun loadPeaks() = withContext(Dispatchers.IO) {
+        val map = HashMap(_peaks.value)
+        _project.value.tracks.mapNotNull { it.audio?.file }.forEach { name ->
+            if (name !in map) {
+                val f = File(audioDir, name)
+                if (f.exists()) map[name] = PcmFile.peaks(f)
             }
-            OutputTarget.InternalSynth -> null
-        } ?: return null
-        return MidiOut { data -> devicesRepo.send(id, data) }
+        }
+        _peaks.value = map
+    }
+
+    fun newProject() {
+        if (_transport.value == TransportState.RECORDING) return
+        stop()
+        updateProject { Project(bpm = it.bpm, beatsPerBar = it.beatsPerBar) }
+        _selection.value = null
+        _cursor.value = 0
+        _position.value = 0
+    }
+
+    fun importMidi(uri: Uri) {
+        stop()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val bytes = getApplication<Application>().contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+                val current = _project.value
+                val imported = MidiFile.read(bytes, current.nextTrackId)
+                if (imported.tracks.isEmpty()) {
+                    _messages.tryEmit("El archivo MIDI no tiene notas")
+                    return@launch
+                }
+                withContext(Dispatchers.Main) {
+                    updateProject { p ->
+                        if (p.tracks.isEmpty()) {
+                            imported
+                        } else {
+                            p.copy(tracks = p.tracks + imported.tracks, nextTrackId = imported.nextTrackId)
+                        }
+                    }
+                }
+                _messages.tryEmit("Importadas ${imported.tracks.size} pistas de ${displayName(uri)}")
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo importar el MIDI: ${e.message ?: "archivo no válido"}")
+            }
+        }
+    }
+
+    fun exportMidi(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val data = MidiFile.write(_project.value)
+                getApplication<Application>().contentResolver.openOutputStream(uri, "wt")!!.use { it.write(data) }
+                _messages.tryEmit("MIDI exportado")
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo exportar el MIDI")
+            }
+        }
+    }
+
+    fun importAudio(uri: Uri) {
+        val name = displayName(uri)
+        viewModelScope.launch(Dispatchers.IO) {
+            val file = "${java.util.UUID.randomUUID()}.pcm"
+            val target = File(audioDir, file)
+            try {
+                _busy.value = "Importando $name…"
+                val frames = AudioDecoder.decode(getApplication(), uri, target) { p ->
+                    _busy.value = "Importando $name… ${(p * 100).toInt()} %"
+                }
+                val wave = PcmFile.peaks(target)
+                _peaks.value = _peaks.value + (file to wave)
+                withContext(Dispatchers.Main) {
+                    updateProject { p ->
+                        val id = p.nextTrackId
+                        p.copy(
+                            tracks = p.tracks + Track(
+                                id = id,
+                                name = name.substringBeforeLast('.'),
+                                audio = AudioClip(file, frames, _cursor.value),
+                                colorIndex = ((id - 1) % TRACK_COLORS).toInt(),
+                            ),
+                            nextTrackId = id + 1,
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                target.delete()
+                _messages.tryEmit("No se pudo importar el audio: ${e.message ?: "formato no soportado"}")
+            } finally {
+                _busy.value = null
+            }
+        }
+    }
+
+    fun exportMix(uri: Uri, mp3: Boolean) {
+        val sf = synth.soundFont
+        if (sf == null) {
+            _messages.tryEmit("El sintetizador aún está cargando, inténtalo en unos segundos")
+            return
+        }
+        val project = _project.value
+        if (project.tracks.isEmpty()) {
+            _messages.tryEmit("No hay nada que exportar")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val resolver = getApplication<Application>().contentResolver
+            val label = if (mp3) "MP3" else "WAV"
+            try {
+                _busy.value = "Exportando $label…"
+                val progress: (Float) -> Unit = { _busy.value = "Exportando $label… ${(it * 100).toInt()} %" }
+                if (mp3) {
+                    val out = resolver.openOutputStream(uri, "wt")!!
+                    MixRenderer(project, sf, audioDir).render(Mp3Writer(out.buffered()), onProgress = progress)
+                } else {
+                    val tmp = File(getApplication<Application>().cacheDir, "mezcla.wav")
+                    MixRenderer(project, sf, audioDir).render(WavWriter(tmp), onProgress = progress)
+                    resolver.openOutputStream(uri, "wt")!!.use { out -> tmp.inputStream().use { it.copyTo(out) } }
+                    tmp.delete()
+                }
+                _messages.tryEmit("Mezcla exportada en $label")
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo exportar: ${e.message ?: label}")
+            } finally {
+                _busy.value = null
+            }
+        }
+    }
+
+    // ---------- SoundFonts ----------
+
+    private fun loadSoundFont(name: String) {
+        val sf = SoundFont.load(soundFontLibrary.file(name))
+        synth.soundFont = sf
+        _activeSoundFont.value = name
+        prefs.edit().putString(PREF_SOUNDFONT, name).apply()
+    }
+
+    fun selectSoundFont(name: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                loadSoundFont(name)
+            } catch (e: Exception) {
+                _messages.tryEmit("No se pudo cargar $name")
+            }
+        }
+    }
+
+    fun importSoundFont(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _messages.tryEmit("Cargando SoundFont…")
+            try {
+                val name = soundFontLibrary.import(uri)
+                _soundFonts.value = soundFontLibrary.list()
+                loadSoundFont(name)
+                _messages.tryEmit("$name listo")
+            } catch (e: Exception) {
+                _messages.tryEmit(e.message ?: "No se pudo añadir el SoundFont")
+            }
+        }
+    }
+
+    fun deleteSoundFont(name: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            if (_activeSoundFont.value == name) loadSoundFont(SoundFontLibrary.DEFAULT_FILE)
+            soundFontLibrary.delete(name)
+            _soundFonts.value = soundFontLibrary.list()
+        }
     }
 
     fun setOutput(target: OutputTarget) {
@@ -145,7 +417,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun warnIfNoOutput() {
         if (resolveOutput() == null) {
-            _messages.tryEmit("No hay ninguna salida MIDI conectada para reproducir")
+            _messages.tryEmit("El sintetizador interno aún está cargando")
         }
     }
 
@@ -174,7 +446,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 stop()
                 return
             }
-            TransportState.PLAYING -> player.stop()
+            TransportState.PLAYING -> stopEngines()
             else -> Unit
         }
         val from = if (_transport.value == TransportState.STOPPED) {
@@ -197,6 +469,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             recorder.start(fromTick, now, _project.value.bpm)
         }
         player.start(_project.value, fromTick, now)
+        audioPlayer.start(_project.value, fromTick)
+        if (_metronomeOn.value) metronome.start(fromTick, _project.value.bpm, _project.value.beatsPerBar)
         _transport.value = state
         startTicker()
     }
@@ -206,14 +480,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (state != TransportState.PLAYING && state != TransportState.RECORDING) return
         tickerJob?.cancel()
         _position.value = currentTick()
-        player.stop()
+        stopEngines()
         if (state == TransportState.RECORDING) finishRecording()
         _transport.value = TransportState.PAUSED
     }
 
     fun stop() {
         tickerJob?.cancel()
-        player.stop()
+        stopEngines()
         if (_transport.value == TransportState.RECORDING) finishRecording()
         _transport.value = TransportState.STOPPED
         _position.value = _cursor.value
@@ -222,11 +496,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun goToStart() {
         val wasPlaying = _transport.value == TransportState.PLAYING
         if (_transport.value == TransportState.RECORDING) return
-        if (wasPlaying) player.stop()
+        if (wasPlaying) stopEngines()
         _cursor.value = 0
         _position.value = 0
         _selection.value = null
         if (wasPlaying) beginTransport(0, TransportState.PLAYING) else _transport.value = TransportState.STOPPED
+    }
+
+    private fun stopEngines() {
+        player.stop()
+        metronome.stop()
+        audioPlayer.stop()
+    }
+
+    fun toggleMetronome() {
+        val on = !_metronomeOn.value
+        _metronomeOn.value = on
+        val state = _transport.value
+        if (state == TransportState.PLAYING || state == TransportState.RECORDING) {
+            if (on) {
+                metronome.start(currentTick(), _project.value.bpm, _project.value.beatsPerBar)
+            } else {
+                metronome.stop()
+            }
+        }
     }
 
     private fun currentTick(): Long =
@@ -276,7 +569,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _transport.value = TransportState.STOPPED
             }
             TransportState.PLAYING -> {
-                player.stop()
+                stopEngines()
                 beginTransport(t, TransportState.PLAYING)
             }
             TransportState.RECORDING -> Unit
@@ -295,19 +588,108 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Selecciona la pista entera, como al pulsar su cabecera en Audacity. */
-    fun selectTrack(trackId: Long) {
-        val end = maxOf(_project.value.endTick, PPQ.toLong())
+    fun selectRow(trackIds: Set<Long>) {
+        val end = maxOf(_project.value.endTick + 1, PPQ.toLong())
         val current = _selection.value
-        _selection.value = if (current != null && current.trackIds == setOf(trackId) && current.startTick == 0L) {
+        _selection.value = if (current != null && current.trackIds == trackIds && current.startTick == 0L) {
             null
         } else {
-            Selection(0, end, setOf(trackId))
+            Selection(0, end, trackIds)
         }
     }
 
-    fun toggleMute(trackId: Long) = updateTrack(trackId) { it.copy(muted = !it.muted) }
+    // ---------- Cuantizar, borrar, agrupar ----------
 
-    fun toggleSolo(trackId: Long) = updateTrack(trackId) { it.copy(solo = !it.solo) }
+    fun quantizeSelection(grid: QuantizeGrid, quantizeEnds: Boolean) {
+        val sel = _selection.value ?: return
+        quantize(sel.trackIds, sel.startTick, sel.endTick, grid, quantizeEnds)
+    }
+
+    fun quantizeTrack(trackId: Long, grid: QuantizeGrid, quantizeEnds: Boolean) =
+        quantize(setOf(trackId), 0, Long.MAX_VALUE, grid, quantizeEnds)
+
+    private fun quantize(ids: Set<Long>, start: Long, end: Long, grid: QuantizeGrid, ends: Boolean) {
+        updateProject { p ->
+            p.copy(tracks = p.tracks.map { t ->
+                if (t.id in ids) t.copy(notes = Quantizer.quantize(t.notes, grid.ticks, start, end, 1f, ends)) else t
+            })
+        }
+        _messages.tryEmit("Cuantizado a ${grid.label}")
+    }
+
+    fun deleteSelectedNotes() {
+        val sel = _selection.value ?: return
+        updateProject { p ->
+            p.copy(tracks = p.tracks.map { t ->
+                if (t.id in sel.trackIds) {
+                    t.copy(
+                        notes = t.notes.filterNot { it.startTick >= sel.startTick && it.startTick < sel.endTick },
+                        controls = t.controls.filterNot { it.tick >= sel.startTick && it.tick < sel.endTick },
+                    )
+                } else {
+                    t
+                }
+            })
+        }
+    }
+
+    fun groupSelected() {
+        val sel = _selection.value ?: return
+        if (sel.trackIds.size < 2) {
+            _messages.tryEmit("Selecciona dos o más pistas para agruparlas")
+            return
+        }
+        updateProject { p ->
+            val id = p.nextGroupId
+            val names = p.tracks.filter { it.id in sel.trackIds }.joinToString(" + ") { it.name }
+            cleanGroups(
+                p.copy(
+                    tracks = p.tracks.map { if (it.id in sel.trackIds) it.copy(groupId = id) else it },
+                    groups = p.groups + TrackGroup(id, names),
+                    nextGroupId = id + 1,
+                ),
+            )
+        }
+        _selection.value = null
+    }
+
+    fun ungroup(groupId: Long) {
+        updateProject { p ->
+            cleanGroups(p.copy(tracks = p.tracks.map { if (it.groupId == groupId) it.copy(groupId = null) else it }))
+        }
+    }
+
+    /** Quita grupos vacíos o de una sola pista. */
+    private fun cleanGroups(p: Project): Project {
+        val counts = p.tracks.mapNotNull { it.groupId }.groupingBy { it }.eachCount()
+        val alive = counts.filterValues { it >= 2 }.keys
+        return p.copy(
+            groups = p.groups.filter { it.id in alive },
+            tracks = p.tracks.map { if (it.groupId != null && it.groupId !in alive) it.copy(groupId = null) else it },
+        )
+    }
+
+    /** Mute o Solo de un grupo entero: si todas lo tienen, se quita; si no, se pone. */
+    fun toggleMuteAll(ids: Set<Long>) = updateProject { p ->
+        val allOn = p.tracks.filter { it.id in ids }.all { it.muted }
+        p.copy(tracks = p.tracks.map { if (it.id in ids) it.copy(muted = !allOn) else it })
+    }
+
+    fun toggleSoloAll(ids: Set<Long>) = updateProject { p ->
+        val allOn = p.tracks.filter { it.id in ids }.all { it.solo }
+        p.copy(tracks = p.tracks.map { if (it.id in ids) it.copy(solo = !allOn) else it })
+    }
+
+    fun undo() {
+        if (_transport.value == TransportState.RECORDING) return
+        val previous = undoStack.removeLastOrNull() ?: return
+        _canUndo.value = undoStack.isNotEmpty()
+        _project.value = previous
+        player.updateAudible(previous)
+        _selection.value = null
+        scheduleSave()
+    }
+
 
     fun renameTrack(trackId: Long, name: String) = updateTrack(trackId) { it.copy(name = name.ifBlank { it.name }) }
 
@@ -322,7 +704,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun setChannel(trackId: Long, channel: Int) = updateTrack(trackId) { it.copy(channel = channel.coerceIn(0, 15)) }
 
     fun deleteTrack(trackId: Long) {
-        updateProject { p -> p.copy(tracks = p.tracks.filterNot { it.id == trackId }) }
+        updateProject { p -> cleanGroups(p.copy(tracks = p.tracks.filterNot { it.id == trackId })) }
         _selection.value = _selection.value?.let { s ->
             s.copy(trackIds = s.trackIds - trackId).takeIf { it.trackIds.isNotEmpty() }
         }
@@ -331,11 +713,60 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun changeBpm(delta: Double) = setBpm(_project.value.bpm + delta)
 
     fun setBpm(bpm: Double) {
-        if (_transport.value == TransportState.PLAYING || _transport.value == TransportState.RECORDING) {
-            _messages.tryEmit("Detén la reproducción para cambiar el BPM")
-            return
+        when (_transport.value) {
+            TransportState.RECORDING -> {
+                _messages.tryEmit("No se puede cambiar el BPM mientras se graba")
+            }
+            TransportState.PLAYING -> {
+                // Sigue sonando desde el mismo punto con el tempo nuevo.
+                val at = currentTick()
+                stopEngines()
+                updateProject { it.copy(bpm = bpm.coerceIn(20.0, 300.0)) }
+                beginTransport(at, TransportState.PLAYING)
+            }
+            else -> updateProject { it.copy(bpm = bpm.coerceIn(20.0, 300.0)) }
         }
-        updateProject { it.copy(bpm = bpm.coerceIn(20.0, 300.0)) }
+    }
+
+    // ---------- Botones del controlador (modo aprender) ----------
+
+    fun learn(action: ControlAction?) {
+        mapper.startLearning(action)
+        _learning.value = action
+    }
+
+    fun clearBinding(action: ControlAction) {
+        mapper.clear(action)
+        saveBindings()
+    }
+
+    private fun saveBindings() {
+        val b = mapper.bindings()
+        _controlBindings.value = b
+        prefs.edit().putString(PREF_CONTROLS, ControlMapper.encode(b)).apply()
+    }
+
+    private fun perform(action: ControlAction) {
+        when (action) {
+            ControlAction.RECORD -> record()
+            ControlAction.PLAY_PAUSE -> playPause()
+            ControlAction.STOP -> stop()
+            ControlAction.GO_TO_START -> goToStart()
+            ControlAction.METRONOME -> toggleMetronome()
+            ControlAction.BPM_UP -> changeBpm(1.0)
+            ControlAction.BPM_DOWN -> changeBpm(-1.0)
+            ControlAction.UNDO -> undo()
+            ControlAction.MUTE, ControlAction.SOLO -> {
+                val ids = _selection.value?.trackIds
+                if (ids.isNullOrEmpty()) {
+                    _messages.tryEmit("Selecciona una pista para usar Mute o Solo desde el controlador")
+                } else if (action == ControlAction.MUTE) {
+                    toggleMuteAll(ids)
+                } else {
+                    toggleSoloAll(ids)
+                }
+            }
+        }
     }
 
     private fun updateTrack(trackId: Long, change: (Track) -> Track) = updateProject { p ->
@@ -343,9 +774,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun updateProject(change: (Project) -> Project) {
-        val updated = change(_project.value)
+        val before = _project.value
+        val updated = change(before)
+        if (updated == before) return
+        undoStack.addLast(before)
+        while (undoStack.size > MAX_UNDO) undoStack.removeFirst()
+        _canUndo.value = true
         _project.value = updated
         player.updateAudible(updated)
+        audioPlayer.updateAudible(updated)
         scheduleSave()
     }
 
@@ -377,5 +814,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         const val TRACK_COLORS = 8
+        const val MAX_UNDO = 50
+        const val PREF_CONTROLS = "controls"
+        const val PREF_SOUNDFONT = "soundfont"
     }
 }

@@ -18,7 +18,7 @@ fun interface MidiOut {
  */
 class Player(private val output: () -> MidiOut?) {
 
-    internal data class ScheduledEvent(
+    data class ScheduledEvent(
         val tick: Long,
         /** Orden dentro del mismo tick: program change, note off, controles, note on. */
         val order: Int,
@@ -28,7 +28,7 @@ class Player(private val output: () -> MidiOut?) {
         val bytes: ByteArray,
     )
 
-    internal enum class Kind { PROGRAM, NOTE_OFF, CONTROL, NOTE_ON }
+    enum class Kind { PROGRAM, NOTE_OFF, CONTROL, NOTE_ON }
 
     @Volatile private var thread: Thread? = null
     @Volatile private var audible: Set<Long> = emptySet()
@@ -119,7 +119,7 @@ class Player(private val output: () -> MidiOut?) {
 
     private fun noteKey(channel: Int, note: Int) = channel * 128 + note
 
-    internal companion object {
+    companion object {
         fun buildEvents(project: Project, fromTick: Long): List<ScheduledEvent> {
             val list = ArrayList<ScheduledEvent>()
             for (track in project.tracks) {
